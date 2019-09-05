@@ -9,7 +9,7 @@ import com.typesafe.config.{Config, ConfigValue}
 import common.exception.MessageAggregation
 import common.validation.ErrorOr._
 import common.validation.Validation._
-import cromwell.backend.google.pipelines.common.PipelinesApiConfigurationAttributes.{LocalizationConfiguration, BatchRequestTimeoutConfiguration, VirtualPrivateCloudConfiguration}
+import cromwell.backend.google.pipelines.common.PipelinesApiConfigurationAttributes.{BatchRequestTimeoutConfiguration, GcsTransferConfiguration, VirtualPrivateCloudConfiguration}
 import cromwell.backend.google.pipelines.common.authentication.PipelinesApiAuths
 import cromwell.backend.google.pipelines.common.callcaching.{CopyCachedOutputs, PipelinesCacheHitDuplicationStrategy, UseOriginalCachedOutputs}
 import cromwell.cloudsupport.gcp.GoogleConfiguration
@@ -23,6 +23,7 @@ import org.slf4j.{Logger, LoggerFactory}
 import scala.collection.JavaConverters._
 import scala.concurrent.duration._
 import scala.util.Try
+import scala.util.matching.Regex
 
 case class PipelinesApiConfigurationAttributes(project: String,
                                                computeServiceAccount: String,
@@ -35,17 +36,16 @@ case class PipelinesApiConfigurationAttributes(project: String,
                                                cacheHitDuplicationStrategy: PipelinesCacheHitDuplicationStrategy,
                                                requestWorkers: Int Refined Positive,
                                                logFlushPeriod: Option[FiniteDuration],
-                                               localizationConfiguration: LocalizationConfiguration,
+                                               gcsTransferConfiguration: GcsTransferConfiguration,
                                                virtualPrivateCloudConfiguration: Option[VirtualPrivateCloudConfiguration],
                                                batchRequestTimeoutConfiguration: BatchRequestTimeoutConfiguration)
 
 object PipelinesApiConfigurationAttributes {
 
   /**
-    * @param localizationAttempts Also used for de-localization. This is the number of attempts, not retries,
-    *                             hence it is positive.
+    * @param transferAttempts This is the number of attempts, not retries, hence it is positive.
     */
-  case class LocalizationConfiguration(localizationAttempts: Int Refined Positive)
+  case class GcsTransferConfiguration(transferAttempts: Int Refined Positive, parallelCompositeUploadThreshold: String)
 
   final case class VirtualPrivateCloudConfiguration(name: String, subnetwork: Option[String], auth: GoogleAuthMode)
   final case class BatchRequestTimeoutConfiguration(readTimeoutMillis: Option[Int Refined Positive], connectTimeoutMillis: Option[Int Refined Positive])
@@ -54,7 +54,7 @@ object PipelinesApiConfigurationAttributes {
   lazy val Logger = LoggerFactory.getLogger("PipelinesApiConfiguration")
 
   val GenomicsApiDefaultQps = 1000
-  val DefaultLocalizationAttempts = refineMV[Positive](3)
+  val DefaultGcsTransferAttempts = refineMV[Positive](3)
 
   private val papiKeys = Set(
     "project",
@@ -67,6 +67,7 @@ object PipelinesApiConfigurationAttributes {
     "genomics.endpoint-url",
     "genomics-api-queries-per-100-seconds",
     "genomics.localization-attempts",
+    "genomics.parallel-composite-upload-threshold",
     "dockerhub",
     "dockerhub.account",
     "dockerhub.token",
@@ -150,11 +151,14 @@ object PipelinesApiConfigurationAttributes {
       case None => Option(1.minute)
     }
 
-    val localizationConfiguration: ErrorOr[LocalizationConfiguration] =
-      backendConfig.as[Option[Int]]("genomics.localization-attempts")
-        .map(attempts => validatePositiveInt(attempts, "genomics.localization-attempts"))
-        .map(_.map(LocalizationConfiguration.apply))
-        .getOrElse(LocalizationConfiguration(DefaultLocalizationAttempts).validNel)
+    val parallelCompositeUploadThreshold = validateGsutilMemorySpecification(backendConfig, "genomics.parallel-composite-upload-threshold")
+
+    val localizationAttempts: ErrorOr[Int Refined Positive] = backendConfig.as[Option[Int]]("genomics.localization-attempts")
+      .map(attempts => validatePositiveInt(attempts, "genomics.localization-attempts"))
+      .getOrElse(DefaultGcsTransferAttempts.validNel)
+
+    val gcsTransferConfiguration: ErrorOr[GcsTransferConfiguration] =
+      (localizationAttempts, parallelCompositeUploadThreshold) mapN GcsTransferConfiguration.apply
 
     val vpcNetworkLabel: ErrorOr[Option[String]] = validate { backendConfig.getAs[String]("virtual-private-cloud.network-label-key") }
     val vpcSubnetworkLabel: ErrorOr[Option[String]] = validate { backendConfig.getAs[String]("virtual-private-cloud.subnetwork-label-key") }
@@ -180,7 +184,7 @@ object PipelinesApiConfigurationAttributes {
                                                        qps: Int Refined Positive,
                                                        cacheHitDuplicationStrategy: PipelinesCacheHitDuplicationStrategy,
                                                        requestWorkers: Int Refined Positive,
-                                                       localizationConfiguration: LocalizationConfiguration,
+                                                       gcsTransferConfiguration: GcsTransferConfiguration,
                                                        virtualPrivateCloudConfiguration: Option[VirtualPrivateCloudConfiguration],
                                                        batchRequestTimeoutConfiguration: BatchRequestTimeoutConfiguration): ErrorOr[PipelinesApiConfigurationAttributes] =
       (googleConfig.auth(genomicsName), googleConfig.auth(gcsName)) mapN {
@@ -197,7 +201,7 @@ object PipelinesApiConfigurationAttributes {
             cacheHitDuplicationStrategy = cacheHitDuplicationStrategy,
             requestWorkers = requestWorkers,
             logFlushPeriod = logFlushPeriod,
-            localizationConfiguration = localizationConfiguration,
+            gcsTransferConfiguration = gcsTransferConfiguration,
             virtualPrivateCloudConfiguration = virtualPrivateCloudConfiguration,
             batchRequestTimeoutConfiguration = batchRequestTimeoutConfiguration
           )
@@ -212,7 +216,7 @@ object PipelinesApiConfigurationAttributes {
       qpsValidation,
       duplicationStrategy,
       requestWorkers,
-      localizationConfiguration,
+      gcsTransferConfiguration,
       virtualPrivateCloudConfiguration,
       batchRequestTimeoutConfigurationValidation
     ) flatMapN authGoogleConfigForPapiConfigurationAttributes match {
@@ -234,6 +238,15 @@ object PipelinesApiConfigurationAttributes {
     refineV[Positive](qpsCandidate) match {
       case Left(_) => s"Calculated QPS for Google Genomics API ($qpsCandidate/s) was not a positive integer (supplied value was $qp100s per 100s)".invalidNel
       case Right(refined) => refined.validNel
+    }
+  }
+
+  def validateGsutilMemorySpecification(config: Config, configPath: String): ErrorOr[String] = {
+    val entry = config.as[Option[String]](configPath)
+    entry match {
+      case None => "".validNel
+      case Some(v @ GsutilHumanBytes(_, _)) => v.validNel
+      case Some(bad) => s"Invalid gsutil memory specification in Cromwell configuration at path '$configPath': '$bad'".invalidNel
     }
   }
 
@@ -261,5 +274,35 @@ object PipelinesApiConfigurationAttributes {
       case Some(value) => validate(value).map(Option.apply)
       case None => None.validNel
     }
+  }
+
+  // Copy/port of gsutil's "_GenerateSuffixRegex"
+  // needs tests
+  private [common] lazy val GsutilHumanBytes: Regex = {
+    val _EXP_STRINGS = List(
+      List("B", "bit"),
+      List("KiB", "Kibit", "K"),
+      List("MiB", "Mibit", "M"),
+      List("GiB", "Gibit", "G"),
+      List("TiB", "Tibit", "T"),
+      List("PiB", "Pibit", "P"),
+      List("EiB", "Eibit", "E"),
+    )
+
+    // [s.lower() for s in list(si)[1:]]
+    val suffixes = for {
+      unit <- _EXP_STRINGS
+      name <- unit
+    } yield name
+
+    // Differs from the Python original in a couple of ways:
+    //
+    // * The Python original uses named groups which are not supported in Scala regexes.
+    //   (?P<num>\d*\.\d+|\d+)\s*(?P<suffix>%s)?
+    //
+    // * The Python original lowercases both the units and the human string before running the matcher.
+    //   This Scala version turns on the (?i) case insensitive matching regex option instead.
+    val orSuffixes = suffixes.mkString("|")
+    "(?i)(\\d*\\.\\d+|\\d+)\\s*(%s)?".format(orSuffixes).r
   }
 }
